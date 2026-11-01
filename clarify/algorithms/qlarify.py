@@ -1,6 +1,5 @@
-
 # SPDX-FileCopyrightText: 2026 Taher Ghaleb <taherghaleb@trentu.ca>
-# 
+#
 # SPDX-License-Identifier: MIT
 
 """Qlarify: Contrastive Clarification Through Skeptical Assumption Auditing.
@@ -26,9 +25,9 @@ You are a contrastive clarification algorithm.
 
 Analyze the following programming problem:
 
-{problem['prompt']}
+{problem["prompt"]}
 
-Entry point: {problem['entry_point']}
+Entry point: {problem["entry_point"]}
 
 Consider alternative interpretations, identify implicit assumptions,
 and determine the most reasonable approach to solving the problem.
