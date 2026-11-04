@@ -88,7 +88,13 @@ class _QlarifyBase(ClarificationAlgorithmBase):
     }
 
     def __init__(self, config=None):
-        super().__init__(config)
+        self.initialize_config(config)
+
+    def initialize_config(self, config=None):
+        overrides = dict(config or {})
+        if unknown := set(overrides) - set(self.DEFAULT_CONFIG):
+            raise ValueError(f"Unknown config option(s): {sorted(unknown)}")
+        self.config = {**self.DEFAULT_CONFIG, **overrides}
         for key in ("max_turns", "repair_attempts"):
             value = self.config[key]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -104,16 +110,16 @@ class _QlarifyBase(ClarificationAlgorithmBase):
             raise ValueError("discount_base must be finite and greater than one")
 
     @staticmethod
-    def _call(env, prompt: str) -> str:
+    def call_model(env, prompt: str) -> str:
         return env.llm(
             [{"role": "system", "content": _SYSTEM}, {"role": "user", "content": prompt}]
         )
 
-    def _planning_available(self, env) -> bool:
+    def planning_available(self, env) -> bool:
         return env.prompt_cost < env.prompt_budget * self.config["planning_budget_fraction"]
 
     @staticmethod
-    def _context(problem, answers) -> str:
+    def build_context(problem, answers) -> str:
         return json.dumps(
             {
                 "prompt": problem["prompt"],
@@ -123,7 +129,7 @@ class _QlarifyBase(ClarificationAlgorithmBase):
             ensure_ascii=False,
         )
 
-    def _generate(self, env, context, entry_point, previous="", feedback=""):
+    def generate_code(self, env, context, entry_point, previous="", feedback=""):
         prompt = (
             "Implement the task. Resolve remaining uncertainty using the most direct "
             "reading, not imagined requirements. Actual user answers override conflicting "
@@ -135,12 +141,12 @@ class _QlarifyBase(ClarificationAlgorithmBase):
             prompt += "\nPREVIOUS CODE:\n" + previous
         if feedback:
             prompt += "\nREVIEW (check it against the task before applying):\n" + feedback
-        response = self._call(env, prompt)
+        response = self.call_model(env, prompt)
         candidate = _code(response, entry_point)
         for _ in range(self.config["repair_attempts"]):
             if candidate is not None:
                 break
-            response = self._call(
+            response = self.call_model(
                 env,
                 prompt + "\nYour last response did not contain a "
                 "syntactically valid complete definition. Correct it:\n" + response,
@@ -148,10 +154,10 @@ class _QlarifyBase(ClarificationAlgorithmBase):
             candidate = _code(response, entry_point)
         return candidate
 
-    def _question(self, env, context, candidate, turn):
+    def choose_question(self, env, context, candidate, turn):
         if self.config["compact_planning"]:
-            return self._compact_question(env, context, candidate, turn)
-        audit = self._call(
+            return self.compact_question(env, context, candidate, turn)
+        audit = self.call_model(
             env,
             "Independently audit this specification before reading the draft. Identify at "
             "most four concrete unresolved behavioral choices or contradictions. For each "
@@ -175,10 +181,10 @@ class _QlarifyBase(ClarificationAlgorithmBase):
             + "\nDRAFT:\n"
             + candidate,
         )
-        if not self._planning_available(env):
+        if not self.planning_available(env):
             return None
         decision = _json_object(
-            self._call(
+            self.call_model(
                 env,
                 "You are a skeptical requirements reviewer. Check the audit against the actual "
                 "task; do not trust its claims. Choose at most ONE question that resolves ONE "
@@ -201,11 +207,11 @@ class _QlarifyBase(ClarificationAlgorithmBase):
                 + candidate,
             )
         )
-        return self._select_question(decision, turn)
+        return self.select_question(decision, turn)
 
-    def _compact_question(self, env, context, candidate, turn):
+    def compact_question(self, env, context, candidate, turn):
         decision = _json_object(
-            self._call(
+            self.call_model(
                 env,
                 "Audit this draft against the visible task. First extract the call contract, "
                 "core operation and output contract. Use the entry point as evidence of the "
@@ -237,9 +243,9 @@ class _QlarifyBase(ClarificationAlgorithmBase):
             or not decision["behavioral_difference"].strip()
         ):
             return None
-        return self._select_question(decision, turn)
+        return self.select_question(decision, turn)
 
-    def _select_question(self, decision, turn):
+    def select_question(self, decision, turn):
         question = decision.get("question")
         if not (
             decision.get("ask") is True
@@ -266,12 +272,12 @@ class _QlarifyBase(ClarificationAlgorithmBase):
         answers: list[dict[str, str]] = []
         candidate = None
         try:
-            context = self._context(problem, answers)
-            candidate = self._generate(env, context, entry_point)
+            context = self.build_context(problem, answers)
+            candidate = self.generate_code(env, context, entry_point)
             for turn in range(self.config["max_turns"]):
-                if not env.can_ask() or not self._planning_available(env):
+                if not env.can_ask() or not self.planning_available(env):
                     break
-                question = self._question(
+                question = self.choose_question(
                     env, context, candidate or "No implementation available.", turn
                 )
                 if question is None:
@@ -283,13 +289,13 @@ class _QlarifyBase(ClarificationAlgorithmBase):
                 except TooManyQuestionException:
                     break
                 answers.append({"question": question, "answer": answer})
-                context = self._context(problem, answers)
-                updated = self._generate(env, context, entry_point)
+                context = self.build_context(problem, answers)
+                updated = self.generate_code(env, context, entry_point)
                 if updated is not None:
                     candidate = updated
 
             if candidate is None:
-                candidate = self._generate(
+                candidate = self.generate_code(
                     env,
                     context,
                     entry_point,
@@ -297,9 +303,9 @@ class _QlarifyBase(ClarificationAlgorithmBase):
                 )
             if candidate is None:
                 raise ValueError("Model did not produce a valid implementation")
-            if self.config["review_code"] and self._planning_available(env):
+            if self.config["review_code"] and self.planning_available(env):
                 review = _json_object(
-                    self._call(
+                    self.call_model(
                         env,
                         "Independently review the code against the task and user answers. "
                         "Check signature, types, boundary cases, ordering, duplicates, mutation, "
@@ -314,19 +320,19 @@ class _QlarifyBase(ClarificationAlgorithmBase):
                 )
                 bug = review.get("bug")
                 if isinstance(bug, str) and bug.strip():
-                    updated = self._generate(env, context, entry_point, candidate, bug)
+                    updated = self.generate_code(env, context, entry_point, candidate, bug)
                     if updated is not None:
                         candidate = updated
                 tests = review.get("tests")
                 if self.config["execute_tests"] and isinstance(tests, str) and tests.strip():
-                    candidate = self._test_and_repair(env, context, entry_point, candidate, tests)
+                    candidate = self.test_and_repair(env, context, entry_point, candidate, tests)
         except LimitsExceededException:
             # Keep the last complete implementation when the SDK's hard cap is reached.
             if candidate is None:
                 raise
         return "```python\n" + candidate + "\n```"
 
-    def _test_and_repair(self, env, context, entry_point, candidate, tests):
+    def test_and_repair(self, env, context, entry_point, candidate, tests):
         try:
             tree = ast.parse(tests)
         except (SyntaxError, ValueError):
@@ -361,7 +367,7 @@ class _QlarifyBase(ClarificationAlgorithmBase):
                 token in output for token in ("Traceback (", "Timeout", "Error:", "Exception:")
             ):
                 return candidate
-            if attempt == self.config["repair_attempts"] or not self._planning_available(env):
+            if attempt == self.config["repair_attempts"] or not self.planning_available(env):
                 break
             feedback = (
                 "These generated tests failed. They are fallible: only fix code if "
@@ -371,7 +377,7 @@ class _QlarifyBase(ClarificationAlgorithmBase):
                 + output[-6000:]
             )
             try:
-                updated = self._generate(env, context, entry_point, candidate, feedback)
+                updated = self.generate_code(env, context, entry_point, candidate, feedback)
             except LimitsExceededException:
                 return candidate
             if updated is None:
@@ -390,13 +396,13 @@ class Qlarify(_QlarifyBase):
     }
 
     def __init__(self, config=None):
-        super().__init__(config)
+        self.initialize_config(config)
         if not isinstance(self.config["import_smoke"], bool):
             raise ValueError("import_smoke must be boolean")
         if type(self.config["max_issues"]) is not int or not 1 <= self.config["max_issues"] <= 12:
             raise ValueError("max_issues must be an integer between 1 and 12")
 
-    _AXIS_PRIORITY = {
+    AXIS_PRIORITY = {
         "core_operation": 0,
         "input_contract": 1,
         "return_contract": 1,
@@ -408,7 +414,7 @@ class Qlarify(_QlarifyBase):
     }
 
     @classmethod
-    def _rank_issues(cls, raw, limit):
+    def rank_issues(cls, raw, limit):
         if not isinstance(raw, list):
             return []
         issues = []
@@ -424,7 +430,7 @@ class Qlarify(_QlarifyBase):
                 or not identifier
                 or identifier in identifiers
                 or not isinstance(axis, str)
-                or axis not in cls._AXIS_PRIORITY
+                or axis not in cls.AXIS_PRIORITY
                 or type(conflict) is not bool
             ):
                 continue
@@ -449,16 +455,16 @@ class Qlarify(_QlarifyBase):
             issues,
             key=lambda i: (
                 -1
-                if i["conflict"] and cls._AXIS_PRIORITY[i["axis"]] <= 3
-                else cls._AXIS_PRIORITY[i["axis"]],
-                cls._AXIS_PRIORITY[i["axis"]],
+                if i["conflict"] and cls.AXIS_PRIORITY[i["axis"]] <= 3
+                else cls.AXIS_PRIORITY[i["axis"]],
+                cls.AXIS_PRIORITY[i["axis"]],
             ),
         )
 
-    def _question(self, env, context, candidate, turn):
+    def choose_question(self, env, context, candidate, turn):
         # Intentionally omit candidate: its guessed semantics must not anchor discovery.
         audit = _json_object(
-            self._call(
+            self.call_model(
                 env,
                 "Inspect only the actual task and prior user answers below. Before any code "
                 "is considered, identify which facts determine the function's main behavior: "
@@ -485,11 +491,11 @@ class Qlarify(_QlarifyBase):
                 "means the task can be implemented.\nACTUAL TASK:\n" + context,
             )
         )
-        ranked = self._rank_issues(audit.get("issues"), self.config["max_issues"])
-        if not ranked or not self._planning_available(env):
+        ranked = self.rank_issues(audit.get("issues"), self.config["max_issues"])
+        if not ranked or not self.planning_available(env):
             return None
         critique = _json_object(
-            self._call(
+            self.call_model(
                 env,
                 "Decide which proposed clarification issues are real blockers to correct "
                 "ordinary behavior. The list is ordered by contract impact: substantial "
@@ -538,7 +544,7 @@ class Qlarify(_QlarifyBase):
                 return approved[issue["id"]]
         return None
 
-    def _generate(self, env, context, entry_point, previous="", feedback=""):
+    def generate_code(self, env, context, entry_point, previous="", feedback=""):
         task = json.loads(context)
         contract = ""
         if not re.search(r"\bdef\s+\w+\s*\(", task["prompt"]):
@@ -550,7 +556,7 @@ class Qlarify(_QlarifyBase):
                 "unambiguously against the data. Do not discard meaningful arguments or "
                 "invent arbitrary overloads. Preserve every explicitly stated interface. "
             )
-        candidate = super()._generate(env, context, entry_point, previous, contract + feedback)
+        candidate = super().generate_code(env, context, entry_point, previous, contract + feedback)
         if candidate is None or not self.config["import_smoke"]:
             return candidate
         try:
@@ -563,10 +569,10 @@ class Qlarify(_QlarifyBase):
             return candidate
         # Only actual module-load failures justify a repair. Missing infrastructure
         # and timeouts do not establish a coding defect.
-        if "Traceback (" not in output or not self._planning_available(env):
+        if "Traceback (" not in output or not self.planning_available(env):
             return candidate
         try:
-            repaired = super()._generate(
+            repaired = super().generate_code(
                 env,
                 context,
                 entry_point,
